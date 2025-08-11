@@ -3,15 +3,35 @@ local expscroll = {}
 local ctrl_y = vim.api.nvim_replace_termcodes("<C-y>", false, false, true)
 local ctrl_e = vim.api.nvim_replace_termcodes("<C-e>", false, false, true)
 
+-----------------------------------------------------------------------------------------
+-- Cursor settings
+
+-- Highlight group to hide the cursor
+-- local hl_callback = function()
+--   vim.api.nvim_set_hl(
+--     0,
+--     "NeoscrollHiddenCursor",
+--     { reverse = true, blend = 100 }
+--   )
+-- end
+-- hl_callback()
+-- local cursor_group = vim.api.nvim_create_augroup("NeoscrollHiddenCursor", {})
+-- vim.api.nvim_create_autocmd(
+--   { "ColorScheme" },
+--   { group = cursor_group, callback = hl_callback }
+-- )
+-- -----------------------------------------------------------------------------------------
+
 local state = 
 {
-  lines_to_scroll = 0,
-  lines_scrolled = 0,
+  window_lines_to_scroll = 0,
+  window_lines_scrolled = 0,
+  cursor_lines_to_scroll = 0,
+  cursor_lines_scrolled = 0,
   timer = vim.loop.new_timer(),
   scrolling = false,
-  scroll_cursor = false,
-  scroll_window = false,
-  t = 0,
+  scrolling_last_frame = false,
+  -- guicursor = ""
 }
 
 local debugging = false
@@ -19,8 +39,8 @@ local debugging = false
 -- animations
 -- frame dt (60 FPS)
 local target_fps = 60.0
-local target_frame_dt_ms = 1000.0/target_fps
-local target_frame_dt_secs = 1.0/target_fps
+-- NOTE: ms is taken as integer
+local target_frame_dt_ms = 1000.0/target_fps - 1
 
 -- current win handler
 local win = vim.api.nvim_get_current_win()
@@ -49,6 +69,24 @@ local function dprint(...)
   end
 end
 
+local function pre_book()
+  vim.opt.eventignore:append({
+    'WinScrolled',
+    'CursorMoved',
+  })
+end
+
+local function post_hook()
+  vim.opt.eventignore:remove({
+    'WinScrolled',
+    'CursorMoved',
+  })
+end
+
+local function clamp(mn, v, mx)
+  return math.min(math.max(mn, v), mx)
+end
+
 local function init()
 	win = vim.api.nvim_get_current_win()
 	buf = vim.api.nvim_get_current_buf()
@@ -65,67 +103,108 @@ function expscroll.scroll()
   local now = vim.loop.hrtime()
   local frame_dt_secs = (now - last_time) / 1e9
   last_time = now
+  local fps = 0
   if frame_dt_secs > 0 then
-    local fps = 1.0/frame_dt_secs
+    fps = 1.0/frame_dt_secs
     print("fps", fps, "frame_dt_secs", frame_dt_secs)
   end
 
   local scrolling = state.scrolling
   if scrolling then
-    local lines_to_scroll = state.lines_to_scroll - state.lines_scrolled
-    dprint("lines_to_scroll total", state.lines_to_scroll)
-    dprint("lines_scrolled ", state.lines_to_scroll)
-    dprint("lines_to_scroll ", lines_to_scroll)
+    print("state", fps, state.window_lines_to_scroll, state.window_lines_scrolled, state.cursor_lines_to_scroll, state.cursor_lines_scrolled)
+    if scrolling ~= state.scrolling_last_frame then
+      dprint("pre_book")
+      pre_book()
+    end
 
-    if lines_to_scroll ~= 0 then
+    -- hide cursor
+    -- vim.opt.guicursor = ""
+    -- if vim.o.termguicolors and vim.o.guicursor ~= "" and vim.o.guicursor ~= "a:NeoscrollHiddenCursor" then
+    --   state.guicursor = vim.o.guicursor
+    --   vim.o.guicursor = "a:NeoscrollHiddenCursor"
+    -- end
 
-      local lines_to_scroll_this_frame = 0
+    local vast_rate = 1 - (2 ^ (-60.0 * frame_dt_secs))
+    local fast_rate = 1 - (2 ^ (-50.0 * frame_dt_secs))
+    local fish_rate = 1 - (2 ^ (-40.0 * frame_dt_secs))
+    local slow_rate = 1 - (2 ^ (-30.0 * frame_dt_secs))
+    local slug_rate = 1 - (2 ^ (-15.0 * frame_dt_secs))
+    local slaf_rate = 1 - (2 ^ (-8.0  * frame_dt_secs))
 
-      local vast_rate = 1 - (2 ^ (-60.0 * frame_dt_secs))
-      local fast_rate = 1 - (2 ^ (-50.0 * frame_dt_secs))
-      local fish_rate = 1 - (2 ^ (-40.0 * frame_dt_secs))
-      local slow_rate = 1 - (2 ^ (-30.0 * frame_dt_secs))
-      local slug_rate = 1 - (2 ^ (-15.0 * frame_dt_secs))
-      local slaf_rate = 1 - (2 ^ (-8.0  * frame_dt_secs))
+    -- local rate = slaf_rate
+    local rate = slaf_rate
 
-      lines_to_scroll_this_frame = fast_rate * lines_to_scroll + state.t
-      state.t = lines_to_scroll_this_frame - math.floor(lines_to_scroll_this_frame)
-      lines_to_scroll_this_frame = math.floor(lines_to_scroll_this_frame)
+    local scroll_this_frame = false
+    local scroll_args = ""
 
-      -- if lines_to_scroll > 0 then
-      --   lines_to_scroll_this_frame = math.ceil(fast_rate * lines_to_scroll)
-      -- else
-      --   lines_to_scroll_this_frame = math.floor(fast_rate * lines_to_scroll)
-      -- end
+    -- window lines scroll
+    local window_scroll_args = ""
+    do
+      local lines_to_scroll = state.window_lines_to_scroll - state.window_lines_scrolled
+      local scroll_direction = lines_to_scroll < 0 and -1 or 1
+      lines_to_scroll = math.abs(lines_to_scroll)
 
-      local count = math.abs(lines_to_scroll_this_frame)
-      dprint("lines_to_scroll_this_frame", lines_to_scroll_this_frame)
+      if lines_to_scroll > 0 then
+        local lines_to_scroll_this_frame = rate * lines_to_scroll
+        lines_to_scroll_this_frame = math.ceil(lines_to_scroll_this_frame)
+        lines_to_scroll_this_frame = clamp(0, lines_to_scroll_this_frame, lines_to_scroll)
+        print("window_lines_to_scroll_this_frame", lines_to_scroll_this_frame, "lines_to_scroll", lines_to_scroll)
 
-      local cursor_scroll_cmd = lines_to_scroll > 0 and count .. "gj" or count .. "gk"
-      local cursor_scroll_args = state.scroll_cursor and cursor_scroll_cmd or ""
-      local window_scroll_cmd = lines_to_scroll > 0 and count .. ctrl_e or count .. ctrl_y
-      local window_scroll_args = state.scroll_window and window_scroll_cmd or ""
-      local scroll_args = window_scroll_args .. cursor_scroll_args
+        if lines_to_scroll_this_frame ~= 0 then
+          window_scroll_args = scroll_direction == 1 and lines_to_scroll_this_frame .. ctrl_e or lines_to_scroll_this_frame .. ctrl_y
+          scroll_this_frame = true
+          state.window_lines_scrolled = state.window_lines_scrolled + lines_to_scroll_this_frame*scroll_direction
 
-      dprint("scroll_args ", scroll_args)
-      if lines_to_scroll_this_frame ~= 0 then
-        state.lines_scrolled = state.lines_scrolled + lines_to_scroll_this_frame
-        vim.cmd.normal({ bang = true, args = { scroll_args } })
+          scrolling = state.window_lines_to_scroll ~= state.window_lines_scrolled
+        end
       end
+    end
 
-      -- local scroll_func = function()
-      --   vim.cmd.normal({ bang = true, args = { scroll_args } })
-      -- end
-    else
-      scrolling = false
+    -- cursor lines scroll
+    local cursor_scroll_args = ""
+    do
+      local lines_to_scroll = state.cursor_lines_to_scroll - state.cursor_lines_scrolled
+      local scroll_direction = lines_to_scroll < 0 and -1 or 1
+      lines_to_scroll = math.abs(lines_to_scroll)
+
+      if lines_to_scroll > 0 then
+        local lines_to_scroll_this_frame = rate * lines_to_scroll
+        lines_to_scroll_this_frame = math.ceil(lines_to_scroll_this_frame)
+        lines_to_scroll_this_frame = clamp(0, lines_to_scroll_this_frame, lines_to_scroll)
+        print("cursor_lines_to_scroll_this_frame", lines_to_scroll_this_frame)
+
+        if lines_to_scroll_this_frame ~= 0 then
+          cursor_scroll_args = scroll_direction == 1 and lines_to_scroll_this_frame .. "gj" or lines_to_scroll_this_frame .. "gk"
+          scroll_this_frame = true
+          state.cursor_lines_scrolled = state.cursor_lines_scrolled + lines_to_scroll_this_frame*scroll_direction
+
+          if state.cursor_lines_to_scroll == state.cursor_lines_scrolled then
+            scrolling = scrolling or false
+          else
+            scrolling = true
+          end
+        end
+      end
+    end
+
+    scroll_args = cursor_scroll_args .. window_scroll_args
+    if scroll_this_frame then
+      print("scroll_args:", scroll_args)
+      vim.cmd.normal({ bang = true, args = { scroll_args } })
     end
   end
 
   state.scrolling = scrolling
 
   if not scrolling then
-    dprint("done")
+    dprint("done", state.window_lines_to_scroll, state.window_lines_scrolled)
     state.timer:stop()
+
+    -- -- show cursor
+    -- if vim.o.guicursor == "a:NeoscrollHiddenCursor" then
+    --   print("show", state.guicursor)
+    --   vim.o.guicursor = state.guicursor
+    -- end
   else
     dprint("scrolling")
   end
@@ -137,16 +216,16 @@ function expscroll.ctrl_u()
   local target_line = buf_pos[1] - half_win_line
   target_line = math.max(1, target_line)
 
-  state.lines_to_scroll = target_line - buf_pos[1]
-  state.lines_scrolled = 0
-  state.scroll_cursor = true
-  state.scroll_window = true
-  last_time = vim.loop.hrtime()
-
-  if not state.scrolling then
-    state.scrolling = true
-    -- NOTE: nvim_cmd must not be called in a fast event context
-    state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+  if target_line ~= buf_pos[1] then
+    state.window_lines_to_scroll = target_line - buf_pos[1]
+    state.window_lines_scrolled = 0
+    state.cursor_lines_to_scroll = state.window_lines_to_scroll
+    state.cursor_lines_scrolled = 0
+    last_time = vim.loop.hrtime()
+    if not state.scrolling then
+      state.scrolling = true
+      state.timer:again()
+    end
   end
 end
 
@@ -154,17 +233,21 @@ function expscroll.ctrl_d()
   init()
 
   local target_line = buf_pos[1] + half_win_line
+  -- TEST
+  -- local target_line = buf_pos[1] + 3
   target_line = math.min(target_line, buf_line_count)
 
-  state.lines_to_scroll = target_line - buf_pos[1]
-  state.lines_scrolled = 0
-  state.scroll_cursor = true
-  state.scroll_window = true
-  last_time = vim.loop.hrtime()
+  if target_line ~= buf_pos[1] then
+    state.window_lines_to_scroll = target_line - buf_pos[1]
+    state.window_lines_scrolled = 0
+    state.cursor_lines_to_scroll = state.window_lines_to_scroll
+    state.cursor_lines_scrolled = 0
+    last_time = vim.loop.hrtime()
 
-  if not state.scrolling then
-    state.scrolling = true
-    state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+    if not state.scrolling then
+      state.scrolling = true
+      state.timer:again()
+    end
   end
 end
 
@@ -177,15 +260,15 @@ function expscroll.j()
     local target_line = buf_pos[1] + lines_to_scroll
     target_line = math.min(target_line, buf_line_count)
 
-    state.lines_to_scroll = target_line - buf_pos[1]
-    state.lines_scrolled = 0
-    state.scroll_cursor = true
-    state.scroll_window = false
+    state.window_lines_to_scroll = 0
+    state.window_lines_scrolled = 0
+    state.cursor_lines_to_scroll = target_line - buf_pos[1]
+    state.cursor_lines_scrolled = 0
     last_time = vim.loop.hrtime()
 
     if not state.scrolling then
       state.scrolling = true
-      state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+      state.timer:again()
     end
   else
     vim.cmd.normal({ bang = true, args = { "j" } })
@@ -201,15 +284,15 @@ function expscroll.k()
     local target_line = buf_pos[1] + lines_to_scroll
     target_line = math.min(target_line, buf_line_count)
 
-    state.lines_to_scroll = target_line - buf_pos[1]
-    state.lines_scrolled = 0
-    state.scroll_cursor = true
-    state.scroll_window = false
+    state.window_lines_to_scroll = 0
+    state.window_lines_scrolled = 0
+    state.cursor_lines_to_scroll = target_line - buf_pos[1]
+    state.cursor_lines_scrolled = 0
     last_time = vim.loop.hrtime()
 
     if not state.scrolling then
       state.scrolling = true
-      state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+      state.timer:again()
     end
   else
     vim.cmd.normal({ bang = true, args = { "k" } })
@@ -218,33 +301,34 @@ end
 
 function expscroll.gg()
   init()
-
   local target_line = 1
-  state.lines_to_scroll = target_line - buf_pos[1]
-  state.lines_scrolled = 0
-  state.scroll_cursor = true
-  state.scroll_window = true
+
+  state.window_lines_to_scroll = target_line - buf_pos[1]
+  state.window_lines_scrolled = 0
+  state.cursor_lines_to_scroll = state.window_lines_to_scroll
+  state.cursor_lines_scrolled = 0
   last_time = vim.loop.hrtime()
 
   if not state.scrolling then
     state.scrolling = true
-    state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+    state.timer:again()
   end
 end
 
 function expscroll.G()
   init()
-
   local target_line = buf_line_count
-  state.lines_to_scroll = target_line - buf_pos[1]
-  state.lines_scrolled = 0
-  state.scroll_cursor = true
-  state.scroll_window = true
+
+  state.window_lines_to_scroll = target_line - buf_pos[1]
+  state.window_lines_scrolled = 0
+  state.cursor_lines_to_scroll = state.window_lines_to_scroll
+  state.cursor_lines_scrolled = 0
   last_time = vim.loop.hrtime()
 
   if not state.scrolling then
     state.scrolling = true
-    state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+    state.timer:again()
+    -- state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
   end
 end
 
@@ -273,12 +357,6 @@ local function_mappings = {
   ["G"]     = function() expscroll.G() end;
   ["gg"]    = function() expscroll.gg() end;
   -- ["zz"]    = function() expscroll.zz() end;
-  -- ["<C-b>"] = function() neoscroll.ctrl_b({duration = 450}) end;
-  -- ["<C-f>"] = function() neoscroll.ctrl_f({duration = 450}) end;
-  -- ["<C-y>"] = function() neoscroll.scroll(-0.1, { move_cursor=false; duration = 100}) end;
-  -- ["<C-e>"] = function() neoscroll.scroll(0.1, {move_cursor=false; duration = 100}) end;
-  -- ["zt"]    = function() neoscroll.zt({half_win_duration = 250}) end;
-  -- ["zb"]    = function() neoscroll.zb({half_win_duration = 250}) end;
 }
 
 function expscroll.setup()
@@ -286,15 +364,17 @@ function expscroll.setup()
 
   vim.keymap.set("n", "<C-u>", function_mappings["<C-u>"])
   vim.keymap.set("n", "<C-d>", function_mappings["<C-d>"])
-  vim.keymap.set("n", "j", function_mappings["j"])
-  vim.keymap.set("n", "k", function_mappings["k"])
-  vim.keymap.set("n", "gg", function_mappings["gg"])
-  vim.keymap.set("n", "G", function_mappings["G"])
+  -- vim.keymap.set("n", "j", function_mappings["j"])
+  -- vim.keymap.set("n", "k", function_mappings["k"])
+  -- vim.keymap.set("n", "gg", function_mappings["gg"])
+  -- vim.keymap.set("n", "G", function_mappings["G"])
   -- vim.keymap.set("n", "zz", function_mappings["zz"])
 
   -- some performance settings
   vim.opt.lazyredraw = true
   vim.ttyfast = true
+  state.timer:start(0, target_frame_dt_ms, vim.schedule_wrap(expscroll.scroll))
+  state.timer:stop()
 end
 
 return expscroll

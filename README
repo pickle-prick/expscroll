@@ -1,0 +1,4 @@
+Exponential smooth scrolling for neovim
+============
+
+Animating using lua uv is not working well, don't use this
